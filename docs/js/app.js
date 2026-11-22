@@ -549,7 +549,7 @@
     $$('[data-act]', el).forEach(b => b.onclick = async () => {
       const tr = b.closest('tr'), id = tr.dataset.u, u = users.find(x => x.user_id === id), cell = tr.lastElementChild;
       if (b.dataset.act === 'unlock') {
-        try { await Api.adminUnlockUser(session.token, id); toast(`הנעילה של ${u.name} בוטלה. הוא יכול להיכנס עכשיו עם הקוד שלו.`); renderAdmin(el); } catch (e) { toast(errText(e)); }
+        try { await Api.adminUnlockUser(session.token, id); toast(`הנעילה של ${u.name} בוטלה. אפשר להיכנס עכשיו עם הקוד האישי.`); renderAdmin(el); } catch (e) { toast(errText(e)); }
       } else if (b.dataset.act === 'detail') {
         const d = $(`tr[data-d="${CSS.escape(id)}"]`, el);
         if (!d.hidden) { d.hidden = true; return; }
@@ -564,7 +564,7 @@
         $('#pin-cancel', cell).onclick = () => renderAdmin(el);
         $('#pinform', cell).onsubmit = async ev => {
           ev.preventDefault(); const pin = $('input', cell).value.trim();
-          try { await Api.adminResetPin(session.token, id, pin); toast(`הקוד של ${u.name} עודכן. תמסור לו את הקוד החדש.`); renderAdmin(el); } catch (e) { toast(errText(e)); }
+          try { await Api.adminResetPin(session.token, id, pin); toast(`הקוד של ${u.name} עודכן. צריך למסור את הקוד החדש למשתמש.`); renderAdmin(el); } catch (e) { toast(errText(e)); }
         };
         $('input', cell).focus();
       } else if (b.dataset.act === 'del') {
