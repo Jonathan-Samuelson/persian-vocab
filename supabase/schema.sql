@@ -9,8 +9,10 @@
 --    roles (anon, authenticated).
 --  * The site only calls the functions below (via /rest/v1/rpc/...).
 --    Each one checks a session token that login/register hand out.
---  * PINs are stored as bcrypt hashes. 10 wrong PINs lock the account
---    for 15 minutes.
+--  * PINs are stored as bcrypt hashes. 10 wrong PINs within 24 hours lock
+--    the account for 24 hours. A correct PIN resets the count.
+--    The admin can unlock from the site; if the admin is locked out,
+--    run in the SQL Editor:  select public.unlock_user('full name');
 --  * The user cap (default 30, max 30) and the class code are enforced
 --    here, on the server.
 -- =====================================================================
@@ -36,6 +38,9 @@ create table if not exists public.app_users (
   created_at      timestamptz not null default now(),
   last_seen       timestamptz not null default now()
 );
+
+-- when the current run of wrong PINs started (the count resets 24h after it)
+alter table public.app_users add column if not exists first_failed_at timestamptz;
 
 create table if not exists public.app_sessions (
   token      uuid primary key default gen_random_uuid(),
@@ -129,19 +134,31 @@ create or replace function public.login(p_name text, p_pin text) returns json
 language plpgsql security definer set search_path = public, extensions as $$
 -- Errors are returned as {"error": ...} instead of raised, so that the
 -- failed-attempt counter is committed (a raised error would roll it back).
-declare u public.app_users;
+declare
+  u public.app_users;
+  fails int;
+  first_fail timestamptz;
 begin
-  select * into u from public.app_users where name_key = public._norm_name(p_name);
+  select * into u from public.app_users where name_key = public._norm_name(p_name) for update;
   if not found then return json_build_object('error', 'NO_SUCH_USER'); end if;
-  if u.locked_until is not null and u.locked_until > now() then return json_build_object('error', 'LOCKED'); end if;
-  if u.pin_hash <> crypt(coalesce(p_pin, ''), u.pin_hash) then
-    update public.app_users
-       set failed_attempts = failed_attempts + 1,
-           locked_until = case when failed_attempts + 1 >= 10 then now() + interval '15 minutes' else null end
-     where id = u.id;
-    return json_build_object('error', 'BAD_PIN');
+  if u.locked_until is not null and u.locked_until > now() then
+    return json_build_object('error', 'LOCKED', 'locked_until', u.locked_until);
   end if;
-  update public.app_users set failed_attempts = 0, locked_until = null, last_seen = now() where id = u.id;
+  -- a run of wrong PINs older than 24 hours no longer counts
+  fails := u.failed_attempts; first_fail := u.first_failed_at;
+  if first_fail is null or first_fail < now() - interval '24 hours' then fails := 0; first_fail := null; end if;
+  if u.pin_hash <> crypt(coalesce(p_pin, ''), u.pin_hash) then
+    fails := fails + 1; first_fail := coalesce(first_fail, now());
+    if fails >= 10 then
+      update public.app_users set failed_attempts = 0, first_failed_at = null, locked_until = now() + interval '24 hours'
+       where id = u.id;
+      delete from public.app_sessions where user_id = u.id;
+      return json_build_object('error', 'LOCKED', 'locked_until', now() + interval '24 hours');
+    end if;
+    update public.app_users set failed_attempts = fails, first_failed_at = first_fail where id = u.id;
+    return json_build_object('error', 'BAD_PIN', 'remaining', 10 - fails);
+  end if;
+  update public.app_users set failed_attempts = 0, first_failed_at = null, locked_until = null, last_seen = now() where id = u.id;
   return json_build_object('token', public._new_session(u.id), 'name', u.display_name, 'is_admin', u.is_admin);
 end $$;
 
@@ -199,9 +216,10 @@ begin
 end $$;
 
 -- ---------- public functions: admin -----------------------------------
+drop function if exists public.admin_overview(uuid);   -- its columns changed
 create or replace function public.admin_overview(p_token uuid)
 returns table (user_id uuid, name text, is_admin boolean, created_at timestamptz, last_seen timestamptz,
-               known int, learning int, answers int, locked boolean)
+               known int, learning int, answers int, locked boolean, locked_until timestamptz, failed_attempts int)
 language plpgsql security definer set search_path = public as $$
 begin
   perform public._require_admin(p_token);
@@ -210,9 +228,18 @@ begin
            coalesce(sum((p.status = 2)::int), 0)::int,
            coalesce(sum((p.status = 1)::int), 0)::int,
            coalesce(sum(p.correct + p.wrong), 0)::int,
-           (au.locked_until is not null and au.locked_until > now())
+           (au.locked_until is not null and au.locked_until > now()),
+           case when au.locked_until > now() then au.locked_until end,
+           case when au.first_failed_at > now() - interval '24 hours' then au.failed_attempts else 0 end
       from public.app_users au left join public.app_progress p on p.user_id = au.id
      group by au.id order by au.display_name;
+end $$;
+
+create or replace function public.admin_unlock_user(p_token uuid, p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._require_admin(p_token);
+  update public.app_users set locked_until = null, failed_attempts = 0, first_failed_at = null where id = p_user;
 end $$;
 
 create or replace function public.admin_user_progress(p_token uuid, p_user uuid)
@@ -247,7 +274,8 @@ language plpgsql security definer set search_path = public, extensions as $$
 begin
   perform public._require_admin(p_token);
   if p_pin !~ '^[0-9]{4}$' then raise exception 'BAD_PIN'; end if;
-  update public.app_users set pin_hash = crypt(p_pin, gen_salt('bf')), failed_attempts = 0, locked_until = null
+  update public.app_users set pin_hash = crypt(p_pin, gen_salt('bf')), failed_attempts = 0, first_failed_at = null,
+         locked_until = null
    where id = p_user;
   delete from public.app_sessions where user_id = p_user;
 end $$;
@@ -283,6 +311,17 @@ begin
   return 'ok';
 end $$;
 
+-- Emergency unlock, for when the admin is the one locked out. SQL Editor only:
+--   select public.unlock_user('your full name');
+create or replace function public.unlock_user(p_name text) returns text
+language plpgsql security definer set search_path = public as $$
+begin
+  update public.app_users set locked_until = null, failed_attempts = 0, first_failed_at = null
+   where name_key = public._norm_name(p_name);
+  if not found then return 'no user with that name'; end if;
+  return 'ok';
+end $$;
+
 -- ---------- who may call what ------------------------------------------
 revoke all on all functions in schema public from public, anon, authenticated;
 grant execute on function
@@ -290,6 +329,6 @@ grant execute on function
   public.logout(uuid), public.get_progress(uuid), public.save_progress(uuid, json), public.reset_my_progress(uuid),
   public.admin_overview(uuid), public.admin_user_progress(uuid, uuid), public.admin_get_settings(uuid),
   public.admin_set_settings(uuid, text, int), public.admin_reset_pin(uuid, uuid, text),
-  public.admin_delete_user(uuid, uuid), public.admin_export(uuid)
+  public.admin_delete_user(uuid, uuid), public.admin_export(uuid), public.admin_unlock_user(uuid, uuid)
 to anon;
--- make_admin and the _helpers stay callable only from the SQL Editor.
+-- make_admin, unlock_user and the _helpers stay callable only from the SQL Editor.

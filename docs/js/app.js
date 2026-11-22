@@ -18,7 +18,7 @@
     FULL: 'ההרשמה סגורה: הגענו למספר המשתמשים המרבי.',
     NAME_TAKEN: 'השם הזה כבר רשום. אם זה אתה, עבור ל"כניסה" והקלד את הקוד האישי שלך.',
     NO_SUCH_USER: 'לא מצאנו משתמש בשם הזה. בדוק את האיות, או הירשם.',
-    LOCKED: 'יותר מדי ניסיונות שגויים. נסה שוב בעוד 15 דקות.',
+    LOCKED: 'החשבון נעול ל-24 שעות אחרי 10 ניסיונות שגויים. אפשר לבקש ממנהל האתר לבטל את הנעילה.',
     SESSION_EXPIRED: 'פג תוקף הכניסה. היכנס שוב.',
     NOT_ADMIN: 'אין לך הרשאת מנהל.',
     NETWORK: 'אין חיבור לשרת. בדוק את החיבור לאינטרנט ונסה שוב.',
@@ -150,7 +150,13 @@
         await signIn(res);
       } catch (e) {
         const wrongPin = tab === 'login' && e.code === 'BAD_PIN' && /^[0-9]{4}$/.test(pin);
-        err.textContent = wrongPin ? 'הקוד האישי שגוי. אחרי 10 ניסיונות שגויים הכניסה תינעל ל-15 דקות.' : errText(e);
+        const left = e.data && e.data.remaining;
+        const until = e.data && e.data.locked_until;
+        err.textContent = wrongPin
+          ? `הקוד האישי שגוי. ${left === 1 ? 'נותר ניסיון אחד' : `נותרו ${left == null ? 'עוד כמה' : left} ניסיונות`} לפני שהחשבון יינעל ל-24 שעות.`
+          : e.code === 'LOCKED' && until
+            ? `החשבון נעול עד ${fmtDate(until)} אחרי 10 ניסיונות שגויים. אפשר לבקש ממנהל האתר לבטל את הנעילה.`
+            : errText(e);
         err.hidden = false; btn.disabled = false;
       }
     };
@@ -519,10 +525,10 @@
         <div class="tbl" style="margin-top:12px"><table>
           <thead><tr><th>שם</th><th>ידועות</th><th>בלמידה</th><th>תשובות</th><th>נרשם</th><th>פעיל לאחרונה</th><th></th></tr></thead>
           <tbody>${users.map(u => `<tr data-u="${esc(u.user_id)}">
-            <td><strong>${esc(u.name)}</strong>${u.is_admin ? ' <span class="chip L">מנהל</span>' : ''}${u.locked ? ' <span class="chip H">נעול זמנית</span>' : ''}</td>
+            <td><strong>${esc(u.name)}</strong>${u.is_admin ? ' <span class="chip L">מנהל</span>' : ''}${u.locked ? ` <span class="chip H">נעול עד ${esc(fmtDate(u.locked_until))}</span>` : ''}${!u.locked && u.failed_attempts ? ` <span class="chip H">${u.failed_attempts} ניסיונות שגויים היום</span>` : ''}</td>
             <td class="num">${u.known} <span class="muted">(${Math.round(100 * u.known / total)}%)</span></td><td class="num">${u.learning}</td><td class="num">${u.answers}</td>
             <td class="num">${fmtDate(u.created_at)}</td><td class="num">${fmtDate(u.last_seen)}</td>
-            <td><div class="row" style="flex-wrap:nowrap"><button class="btn small" data-act="detail">פירוט</button><button class="btn small" data-act="pin">איפוס קוד</button>${u.is_admin ? '' : '<button class="btn small danger" data-act="del">מחיקה</button>'}</div></td>
+            <td><div class="row" style="flex-wrap:nowrap">${u.locked ? '<button class="btn small primary" data-act="unlock">בטל נעילה</button>' : ''}<button class="btn small" data-act="detail">פירוט</button><button class="btn small" data-act="pin">איפוס קוד</button>${u.is_admin ? '' : '<button class="btn small danger" data-act="del">מחיקה</button>'}</div></td>
           </tr><tr class="detail" data-d="${esc(u.user_id)}" hidden><td colspan="7"></td></tr>`).join('')}</tbody></table></div>
       </div>
       <div class="panel"><h2>גיבוי והשהיה</h2><p class="muted" style="margin:0">כדאי להוריד גיבוי מלא מדי פעם, ובמיוחד לפני חופשה ארוכה. הגיבוי כולל את רשימת המשתמשים ואת כל ההתקדמות (בלי הקודים האישיים).</p></div>
@@ -542,7 +548,9 @@
     };
     $$('[data-act]', el).forEach(b => b.onclick = async () => {
       const tr = b.closest('tr'), id = tr.dataset.u, u = users.find(x => x.user_id === id), cell = tr.lastElementChild;
-      if (b.dataset.act === 'detail') {
+      if (b.dataset.act === 'unlock') {
+        try { await Api.adminUnlockUser(session.token, id); toast(`הנעילה של ${u.name} בוטלה. הוא יכול להיכנס עכשיו עם הקוד שלו.`); renderAdmin(el); } catch (e) { toast(errText(e)); }
+      } else if (b.dataset.act === 'detail') {
         const d = $(`tr[data-d="${CSS.escape(id)}"]`, el);
         if (!d.hidden) { d.hidden = true; return; }
         d.hidden = false; d.firstElementChild.innerHTML = '<span class="muted">טוען…</span>';

@@ -4,7 +4,7 @@
   const cfg = window.APP_CONFIG || {};
   const DEMO = !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY;
 
-  class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
+  class ApiError extends Error { constructor(code, data) { super(code); this.code = code; this.data = data || {}; } }
 
   // ---------- real backend ----------
   async function rpc(fn, args) {
@@ -24,7 +24,7 @@
       if (res.status === 540 || res.status === 503 || /paused/i.test(msg)) throw new ApiError('SERVER_PAUSED');
       throw new ApiError(m ? m[1] : 'SERVER_ERROR');
     }
-    if (body && body.error) throw new ApiError(body.error);
+    if (body && body.error) throw new ApiError(body.error, body);
     return body;
   }
 
@@ -43,6 +43,7 @@
     adminResetPin: (t, u, pin) => rpc('admin_reset_pin', { p_token: t, p_user: u, p_pin: pin }),
     adminDeleteUser: (t, u) => rpc('admin_delete_user', { p_token: t, p_user: u }),
     adminExport: t => rpc('admin_export', { p_token: t }),
+    adminUnlockUser: (t, u) => rpc('admin_unlock_user', { p_token: t, p_user: u }),
   };
 
   // ---------- demo backend (this browser only) ----------
@@ -71,8 +72,17 @@
       return delay({ token: t, name: n, is_admin: u.is_admin });
     },
     async login(name, pin) {
-      const d = db(); const u = d.users.find(x => x.name_key === norm(name));
-      if (!u) throw new ApiError('NO_SUCH_USER'); if (u.pin !== pin) throw new ApiError('BAD_PIN');
+      // Same rules as the SQL login(): 10 wrong PINs within 24h lock the account for 24h.
+      const d = db(); const u = d.users.find(x => x.name_key === norm(name)); const now = Date.now(), DAY = 864e5;
+      if (!u) throw new ApiError('NO_SUCH_USER');
+      if (u.locked_until && u.locked_until > now) throw new ApiError('LOCKED', { locked_until: new Date(u.locked_until).toISOString() });
+      if (!u.first_failed_at || u.first_failed_at < now - DAY) { u.failed = 0; u.first_failed_at = null; }
+      if (u.pin !== pin) {
+        u.failed = (u.failed || 0) + 1; u.first_failed_at = u.first_failed_at || now;
+        if (u.failed >= 10) { u.failed = 0; u.first_failed_at = null; u.locked_until = now + DAY; store(d); throw new ApiError('LOCKED', { locked_until: new Date(u.locked_until).toISOString() }); }
+        store(d); throw new ApiError('BAD_PIN', { remaining: 10 - u.failed });
+      }
+      u.failed = 0; u.first_failed_at = null; u.locked_until = null;
       const t = uid(); d.sessions[t] = u.id; store(d); return delay({ token: t, name: u.display_name, is_admin: u.is_admin });
     },
     async whoami(t) { const d = db(); const u = sessionUser(d, t); store(d); return delay({ name: u.display_name, is_admin: u.is_admin }); },
@@ -86,8 +96,10 @@
     async resetMyProgress(t) { const d = db(); const u = sessionUser(d, t); d.progress[u.id] = {}; store(d); return delay(null); },
     async adminOverview(t) {
       const d = db(); admin(d, t);
-      return delay(d.users.map(u => { const r = rows(d, u.id); return { user_id: u.id, name: u.display_name, is_admin: u.is_admin, created_at: u.created_at, last_seen: u.last_seen, known: r.filter(x => x.status === 2).length, learning: r.filter(x => x.status === 1).length, answers: r.reduce((s, x) => s + x.correct + x.wrong, 0), locked: false }; }));
+      const now = Date.now();
+      return delay(d.users.map(u => { const r = rows(d, u.id); const locked = !!(u.locked_until && u.locked_until > now); return { user_id: u.id, name: u.display_name, is_admin: u.is_admin, created_at: u.created_at, last_seen: u.last_seen, known: r.filter(x => x.status === 2).length, learning: r.filter(x => x.status === 1).length, answers: r.reduce((s, x) => s + x.correct + x.wrong, 0), locked, locked_until: locked ? new Date(u.locked_until).toISOString() : null, failed_attempts: (u.first_failed_at && u.first_failed_at > now - 864e5) ? u.failed : 0 }; }));
     },
+    async adminUnlockUser(t, id) { const d = db(); admin(d, t); const u = d.users.find(x => x.id === id); if (u) { u.locked_until = null; u.failed = 0; u.first_failed_at = null; } store(d); return delay(null); },
     async adminUserProgress(t, id) { const d = db(); admin(d, t); return delay(rows(d, id)); },
     async adminGetSettings(t) { const d = db(); admin(d, t); return delay({ ...d.settings, user_count: d.users.length }); },
     async adminSetSettings(t, code, max) { const d = db(); admin(d, t); if (String(code).trim().length < 4) throw new ApiError('BAD_CLASS_CODE'); if (!(max >= 1 && max <= 30)) throw new ApiError('BAD_MAX'); d.settings = { class_code: String(code).trim(), max_users: max }; store(d); return delay(null); },
