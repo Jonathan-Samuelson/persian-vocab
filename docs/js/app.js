@@ -57,6 +57,7 @@
     const p = progress.get(id) || { status: 0, correct: 0, wrong: 0 };
     p.status = ok ? 2 : 1; ok ? p.correct++ : p.wrong++;
     progress.set(id, p);
+    if (!session) return;   // guest: counts for this visit only, nothing is saved
     const q = pending.get(id) || { id, status: 1, correct: 0, wrong: 0 };
     q.status = p.status; ok ? q.correct++ : q.wrong++;
     pending.set(id, q);
@@ -92,14 +93,21 @@
   async function signIn(res) {
     session = { token: res.token, name: res.name, is_admin: !!res.is_admin };
     ls.set('fa-session', session);
+    quiz = null;
     await loadProgress();
-    if (!location.hash || location.hash === '#login') location.hash = '#practice'; else route();
+    go('#practice');
   }
   async function signOut(msg) {
     try { await flush(); } catch (e) {}
     if (session) { try { await Api.logout(session.token); } catch (e) {} }
-    session = null; progress = new Map(); pending = new Map(); ls.del('fa-session');
-    renderLogin(msg);
+    session = null; progress = new Map(); pending = new Map(); quiz = null; ls.del('fa-session');
+    if (msg) { go('#login', false); renderLogin(msg, 'login'); } else go('#vocab');
+  }
+  // Change the hash and render, even when the hash is already the target.
+  function go(hash, render = true) {
+    if (location.hash === hash) { if (render) route(); }
+    else if (render) location.hash = hash;
+    else history.replaceState(null, '', hash);
   }
   async function loadProgress() {
     const rows = await Api.getProgress(session.token);
@@ -136,9 +144,11 @@
             ${tab === 'login' ? '<small class="muted">שכחת את הקוד? פנה למנהל האתר והוא יאפס לך אותו.</small>' : ''}
           </form>
         </div>
+        <p style="text-align:center"><a href="#vocab" id="as-guest">להמשיך לאתר בלי להתחבר ←</a><br>
+          <small class="muted">אפשר לעיין ולתרגל גם בלי משתמש, אבל ההתקדמות לא תישמר.</small></p>
       </div>`;
-    $('#t-login').onclick = () => { ls.set('fa-login-tab', 'login'); renderLogin(null, 'login'); };
-    $('#t-reg').onclick = () => { ls.set('fa-login-tab', 'register'); renderLogin(null, 'register'); };
+    $('#t-login').onclick = () => { ls.set('fa-login-tab', 'login'); go('#login'); };
+    $('#t-reg').onclick = () => { ls.set('fa-login-tab', 'register'); go('#register'); };
     $('#authform').onsubmit = async ev => {
       ev.preventDefault();
       const name = $('#f-name').value, pin = $('#f-pin').value.trim(), btn = $('#f-go'), err = $('#f-err');
@@ -165,27 +175,40 @@
 
   // ---------- shell ----------
   const VIEWS = { practice: 'תרגול', vocab: 'אוצר מילים', progress: 'ההתקדמות שלי', admin: 'ניהול' };
+  const GUEST_VIEWS = ['vocab', 'practice'];
   function shell(view) {
-    const links = Object.entries(VIEWS).filter(([k]) => k !== 'admin' || session.is_admin)
+    const links = Object.entries(VIEWS)
+      .filter(([k]) => session ? (k !== 'admin' || session.is_admin) : GUEST_VIEWS.includes(k))
       .map(([k, v]) => `<a href="#${k}" ${k === view ? 'aria-current="page"' : ''}>${v}</a>`).join('');
+    const who = session
+      ? `<span>שלום, ${esc(session.name)}</span><button class="linkbtn" id="logout">יציאה</button>`
+      : `<span class="muted">צופה כאורח</span><a class="btn small" href="#login">כניסה</a><a class="btn small primary" href="#register">הרשמה</a>`;
     app.innerHTML = `
       <div class="top">
         <div class="brand"><span class="fa">فارسی</span><strong>38126</strong></div>
         <nav class="nav" aria-label="ניווט">${links}</nav>
-        <div class="who"><span>שלום, ${esc(session.name)}</span><button class="linkbtn" id="logout">יציאה</button></div>
+        <div class="who">${who}</div>
       </div>
       ${Api.DEMO ? '<p class="banner">מצב הדגמה: הנתונים נשמרים רק בדפדפן הזה.</p>' : ''}
+      ${session ? '' : `<p class="banner guest">אתם צופים באתר כאורחים: אפשר לעיין באוצר המילים ולתרגל, אבל ההתקדמות לא נשמרת.
+        כדי לשמור אותה <a href="#login">היכנסו</a> או <a href="#register">צרו משתמש</a>.</p>`}
       <p id="banner" hidden></p>
       <main id="view"></main>`;
-    $('#logout').onclick = () => signOut();
+    if (session) $('#logout').onclick = () => signOut();
     setBanner(banner && banner.text, banner && banner.isErr);
     return $('#view');
   }
 
   function route() {
-    if (!session) return renderLogin();
-    let view = (location.hash || '#practice').slice(1);
-    if (!VIEWS[view] || (view === 'admin' && !session.is_admin)) view = 'practice';
+    const h = location.hash.slice(1);
+    if (h === 'login' || h === 'register') {
+      if (session) return go('#practice');
+      quiz = null;
+      return renderLogin(null, h);
+    }
+    let view = h || (session ? 'practice' : 'vocab');
+    if (session) { if (!VIEWS[view] || (view === 'admin' && !session.is_admin)) view = 'practice'; }
+    else if (!GUEST_VIEWS.includes(view)) view = 'vocab';
     if (quiz && view !== 'practice') quiz = null;
     const el = shell(view);
     ({ practice: renderPractice, vocab: renderVocab, progress: renderProgress, admin: renderAdmin })[view](el);
@@ -218,11 +241,11 @@
             <button data-f="all">כל המקורות</button><button data-f="list">רק מרשימות המילים</button><button data-f="new">רק מה שלא ברשימות</button>
           </div>
         </div>
-        <div class="row">
+        ${session ? `<div class="row">
           <div class="seg" role="group" aria-label="סטטוס">
             <button data-s="all">כל הסטטוסים</button><button data-s="2">ידוע</button><button data-s="1">בלמידה</button><button data-s="0">חדש</button>
           </div>
-        </div>
+        </div>` : ''}
         <div class="row">
           <input type="search" id="v-q" placeholder="חיפוש בפרסית, בעברית או בתעתיק" aria-label="חיפוש">
           <select id="v-src" aria-label="מקור"><option value="">כל קובץ</option>${Object.entries(S).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select>
@@ -234,7 +257,7 @@
       if (st.tab === 'verbs' && x.kind !== 'verb') return false;
       if (st.f === 'list' && !x.inList) return false;
       if (st.f === 'new' && x.inList) return false;
-      if (st.status !== 'all' && String(statusOf(x.id)) !== st.status) return false;
+      if (session && st.status !== 'all' && String(statusOf(x.id)) !== st.status) return false;
       if (st.src && !x.src.includes(st.src)) return false;
       if (st.q) { const q = st.q.toLowerCase(); if (!(x.fa + ' ' + x.tr + ' ' + x.he).toLowerCase().includes(q)) return false; }
       return true;
@@ -245,8 +268,8 @@
       for (const [c, verb] of groups) {
         const rows = ALL.filter(x => x.cat === c && pass(x)); if (!rows.length) continue; n += rows.length;
         html += `<section class="group"><h2>${verb ? 'פעלים · ' : ''}${esc(c)}<small>${rows.length}</small></h2><div class="tbl"><table>
-          <thead><tr><th>פרסית</th><th class="tr">תעתיק</th><th>תרגום</th>${verb ? '<th>גזע עבר</th>' : ''}<th>אצלי</th><th>מקור</th></tr></thead><tbody>
-          ${rows.map(x => `<tr><td class="fa">${esc(x.fa)}</td><td class="tr">${esc(x.tr)}</td><td>${esc(x.he)}${x.inList ? '' : '<span class="new">לא ברשימה</span>'}</td>${verb ? `<td class="stem">${esc(x.stem)}</td>` : ''}<td>${stBadge(statusOf(x.id))}</td><td class="src">${x.src.map(chip).join('')}</td></tr>`).join('')}
+          <thead><tr><th>פרסית</th><th class="tr">תעתיק</th><th>תרגום</th>${verb ? '<th>גזע עבר</th>' : ''}${session ? '<th>אצלי</th>' : ''}<th>מקור</th></tr></thead><tbody>
+          ${rows.map(x => `<tr><td class="fa">${esc(x.fa)}</td><td class="tr">${esc(x.tr)}</td><td>${esc(x.he)}${x.inList ? '' : '<span class="new">לא ברשימה</span>'}</td>${verb ? `<td class="stem">${esc(x.stem)}</td>` : ''}${session ? `<td>${stBadge(statusOf(x.id))}</td>` : ''}<td class="src">${x.src.map(chip).join('')}</td></tr>`).join('')}
           </tbody></table></div></section>`;
       }
       $('#v-out').innerHTML = html || '<p class="muted" style="padding:30px;text-align:center">אין פריטים שמתאימים לסינון הזה.</p>';
@@ -268,8 +291,9 @@
   // ---------- practice ----------
   let quiz = null;
   const DEFAULT_SETUP = { sources: ['L1', 'L2', 'L3', 'L4'], kind: 'all', which: 'unknown', dir: 'fa-he', mode: 'cards', size: '20', translit: true };
-  function getSetup() { const s = Object.assign({}, DEFAULT_SETUP, ls.get('fa-setup-' + (session && session.name), {})); s.sources = s.sources.filter(k => S[k]); return s; }
-  function saveSetup(s) { ls.set('fa-setup-' + session.name, s); }
+  const setupKey = () => 'fa-setup-' + (session ? session.name : '~guest');
+  function getSetup() { const s = Object.assign({}, DEFAULT_SETUP, ls.get(setupKey(), {})); s.sources = s.sources.filter(k => S[k]); return s; }
+  function saveSetup(s) { ls.set(setupKey(), s); }
   function pool(s) {
     return ALL.filter(x => x.src.some(k => s.sources.includes(k)))
       .filter(x => s.kind === 'all' || (s.kind === 'words' ? x.kind === 'word' : x.kind === 'verb'))
@@ -457,7 +481,9 @@
       <div class="panel stack">
         <h2>סיכום הסבב</h2>
         <div class="stats"><div class="stat"><b>${q.right}</b><span>תשובות נכונות</span></div><div class="stat"><b>${q.wrong}</b><span>טעויות</span></div><div class="stat"><b>${acc}%</b><span>דיוק</span></div></div>
-        <p class="muted" style="margin:0">ההתקדמות נשמרה. מילים שסימנתם ✓ בתשובה האחרונה עליהן מסומנות כ"ידוע".</p>
+        ${session
+          ? '<p class="muted" style="margin:0">ההתקדמות נשמרה. מילים שסימנתם ✓ בתשובה האחרונה עליהן מסומנות כ"ידוע".</p>'
+          : '<p class="banner guest" style="margin:0">במצב אורח ההתקדמות לא נשמרת. כדי לשמור אותה ולהמשיך מאותה נקודה בפעם הבאה, <a href="#login">היכנסו</a> או <a href="#register">צרו משתמש</a>.</p>'}
         ${missed.length ? `<h3>מילים לחזור עליהן</h3><div class="tbl"><table><tbody>${missed.map(x => `<tr><td class="fa">${esc(x.fa)}</td><td class="tr">${esc(x.tr)}</td><td>${esc(x.he)}</td><td>${stBadge(statusOf(x.id))}</td></tr>`).join('')}</tbody></table></div>` : '<p>בלי טעויות. כל הכבוד!</p>'}
         <div class="row">
           ${missed.length ? '<button class="btn primary" id="s-again">תרגל שוב את הטעויות</button>' : ''}
@@ -577,14 +603,14 @@
 
   // ---------- boot ----------
   (async function boot() {
-    if (!session) return renderLogin();
+    if (!session) return route();   // visitors land on the site as guests
     try {
       const me = await Api.whoami(session.token);
       session.name = me.name; session.is_admin = !!me.is_admin; ls.set('fa-session', session);
       await loadProgress();
       route();
     } catch (e) {
-      if (e.code === 'SESSION_EXPIRED') { session = null; ls.del('fa-session'); return renderLogin(ERR.SESSION_EXPIRED); }
+      if (e.code === 'SESSION_EXPIRED') { session = null; ls.del('fa-session'); go('#login', false); return renderLogin(ERR.SESSION_EXPIRED, 'login'); }
       app.innerHTML = `<div class="login panel"><h2>אי אפשר להתחבר כרגע</h2><p>${esc(errText(e))}</p><button class="btn primary" onclick="location.reload()">נסה שוב</button></div>`;
     }
   })();
